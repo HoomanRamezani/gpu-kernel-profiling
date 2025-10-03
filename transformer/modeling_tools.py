@@ -1,4 +1,26 @@
+"""
+GPU kernel profiling utilities for attention backends on Hugging Face causal LMs.
 
+This module provides:
+- ATTN_ALIASES / SDPA_IMPL: name mappings to switch HF attention backends and SDPA kernels
+- cleanup_torch_compile: resets Dynamo/Inductor state and forces fresh cache dirs per run
+- build_additive_causal_mask_4d: constructs a causal + padding additive mask for eager attention
+- Qwen2Bench: a focused benchmark harness for a single Transformer layer in Qwen models
+
+High-level flow in Qwen2Bench.run:
+1) Reset compile state and set test parameters (backend, sequence length, etc.)
+2) Optionally wrap the whole layer or just its attention in torch.compile
+3) Prepare synthetic inputs (including RoPE and optional additive mask for eager)
+4) Run a warmup/active schedule while:
+   - Measuring active iterations with CUDA events (for stable wall-clock per-step ms)
+   - Capturing a rich CPU+CUDA trace with torch.profiler for Chrome/Perfetto
+5) Export the trace JSON and return the per-implementation timing summary
+
+Notes:
+- We time only the "active" phase to exclude warmup/JIT/graph capture costs.
+- We tag attention.forward with record_function so kernels are grouped in traces.
+- For some backends (fa2/fa3) we avoid fullgraph=True because of known issues.
+"""
 import os
 import tempfile
 import time
@@ -22,6 +44,8 @@ except:
     _HAVE_FA3 = False
 
 
+# Friendly CLI/backend names mapped to HF internal attention implementation identifiers.
+# "sdpa_*" all route through HF "sdpa" implementation, and we pick a concrete kernel below.
 ATTN_ALIASES = {
     "fa2": "flash_attention_2",
     "fa3": "flash_attention_3",
@@ -33,6 +57,7 @@ ATTN_ALIASES = {
     "flex": "flex_attention",
 }
 
+# Concrete SDPA kernel selection for torch.nn.attention.sdpa_kernel context manager.
 SDPA_IMPL = {
     "sdpa_flash": SDPBackend.FLASH_ATTENTION,
     "sdpa_mem": SDPBackend.EFFICIENT_ATTENTION,
@@ -41,6 +66,14 @@ SDPA_IMPL = {
 }
 
 def cleanup_torch_compile():
+    """Reset compile/allocator state and point Inductor/Triton caches to fresh temp dirs.
+
+    Rationale:
+    - torch._dynamo.reset clears Dynamo state between runs to avoid cross-run caching effects
+    - gc + empty_cache free Python/CUDA memory so subsequent runs start from a clean slate
+    - Setting cache dirs to new temp folders avoids reusing previously compiled kernels,
+      forcing re-compile when comparing different code paths or flags.
+    """
     torch._dynamo.reset()
     gc.collect()
     torch.cuda.empty_cache()
@@ -50,10 +83,20 @@ def cleanup_torch_compile():
 
 
 def build_additive_causal_mask_4d(attn2d: torch.Tensor, *, device, dtype=torch.float32):
-    """
-    attn2d: [B, S] boolean (1=keep, 0=pad); can be None if no padding.
-    Returns additive 4D mask [B, 1, S, S] with 0 on valid positions and
-    large negative on masked ones (causal + optional padding).
+    """Construct a 4D additive attention mask with causal structure and key padding.
+
+    Args:
+        attn2d: Boolean tensor of shape [batch, seq_len] where True keeps a token and
+                False denotes padding. Must not be None for eager mask construction.
+        device: Target CUDA/CPU device for the mask tensors.
+        dtype:  Floating dtype used for the additive mask values (e.g., bf16/fp32).
+
+    Returns:
+        Tensor of shape [batch, 1, seq_len, seq_len] where valid positions contain 0 and
+        masked positions contain a large negative number (finfo(dtype).min). The mask is
+        composed of:
+        - a causal lower-triangular component (prevents attending to future tokens)
+        - an optional key padding component for padded positions in the sequence
     """
     assert attn2d is not None, "attn2d cannot be None for eager mask construction"
 
@@ -70,6 +113,13 @@ def build_additive_causal_mask_4d(attn2d: torch.Tensor, *, device, dtype=torch.f
 
 
 class Qwen2Bench:
+    """Benchmark a single Qwen Transformer layer under different attention backends.
+
+    This class loads a Hugging Face Qwen model, switches its attention implementation
+    and SDPA kernel as requested, optionally compiles a module with torch.compile,
+    and profiles a single layer with synthetic inputs to produce stable per-step timings
+    and a Chrome trace for deep dive analysis.
+    """
     def __init__(
         self,
         model_name: str, 
@@ -96,6 +146,23 @@ class Qwen2Bench:
         enable_compile: bool,
         batch_size: int = 1,
     ):
+        """Execute the benchmark for a specific backend and configuration.
+
+        Args:
+            mode: "layer" to profile the entire Transformer layer, or "attention" to
+                  focus on the attention submodule only (also affects compile scope).
+            attn_backend: Backend alias from ATTN_ALIASES (eager, fa2, sdpa_flash, ...).
+            seq_len: Sequence length for the synthetic inputs.
+            enable_backward: If True, run backward() with a random grad to include grads.
+            enable_compile: If True, wrap the target module's forward in torch.compile.
+            batch_size: Micro-batch size for synthetic inputs.
+
+        Returns:
+            dict with keys:
+                - impl: backend alias string
+                - per_step_ms: average active-iteration time in seconds
+                - trace: path to the exported Chrome trace JSON
+        """
         assert mode in ["layer", "attention"]
 
         cleanup_torch_compile()
@@ -110,6 +177,7 @@ class Qwen2Bench:
             torch.set_grad_enabled(False)
             self.model.eval()
 
+        # Switch HF attention implementation and, for SDPA, the concrete kernel.
         with self.enable_attn_backend():
             layer = self.model.model.layers[self.layer_idx]
 
@@ -120,12 +188,15 @@ class Qwen2Bench:
                 to_compile = layer._modules["self_attn"]
             
             if enable_compile:
+                # Optionally compile either the Layer forward() or only Attention.forward().
                 self.compile_module(
                     module=to_compile,
                     bench_mode=mode,
                 )
 
             # annotate attn.forward()
+            # We wrap attention.forward with a record_function so traces group related ops
+            # under a readable tag (e.g., attn[sdpa_flash:compiled:True]).
             _orig = layer._modules["self_attn"].forward
             def _wrapped(*args, **kwargs):
                 with record_function(tag):
@@ -135,6 +206,7 @@ class Qwen2Bench:
             
 
 
+            # Prepare synthetic inputs (hidden states, RoPE, and additive mask for eager)
             inputs = self.prepare_fake_inputs("layer")
             def run_once():
                 if not enable_backward:
@@ -148,6 +220,7 @@ class Qwen2Bench:
                         out = layer(**inputs)
                 if enable_backward:
                     # backward pass
+                    # Use a random grad_out to exercise backward kernels and memory traffic.
                     grad_out = torch.randn_like(out)
                     with torch.autograd.profiler.record_function("profile::layer_backward"):
                         out.backward(grad_out)
@@ -169,6 +242,8 @@ class Qwen2Bench:
             trace_path += ".json"
 
             # profiler setup
+            # We separate warmup (to stabilize kernels and compilation) from active
+            # iterations that are measured with CUDA events for stable per-step latency.
             warmup_steps = 30
             active_steps = 10
             repeat = 1
@@ -179,6 +254,7 @@ class Qwen2Bench:
             active_time_ms = 0.0
             active_iters = 0
 
+            # Use CUDA events for precise on-device timing during "active" iterations only.
             evt_start = torch.cuda.Event(enable_timing=True)
             evt_end   = torch.cuda.Event(enable_timing=True)
 
@@ -224,6 +300,14 @@ class Qwen2Bench:
                     
 
     def prepare_fake_inputs(self, mode="layer"):
+        """Create synthetic inputs for the selected module and backend.
+
+        Behavior notes:
+        - Always uses bf16 tensors on CUDA to match typical Qwen deployment dtype
+        - Builds a [B,1,S,S] additive mask only when running the full layer in eager mode
+        - Reuses hidden_states buffer across iterations; when backward is enabled we
+          clear its .grad between steps
+        """
         dtype_t = torch.bfloat16
         device = "cuda"
 
@@ -262,6 +346,12 @@ class Qwen2Bench:
         )
         
     def compile_module(self, module, bench_mode):
+        """Wrap module.forward with torch.compile and prime both fwd and bwd.
+
+        We try to compile the forward path and, when requested, compiled autograd
+        for backward as well. Some attention backends (fa2/fa3) do not support
+        full CUDA graphs reliably in older stacks; for those we set fullgraph=False.
+        """
 
         # full CUDA graph does not work for vanilla fa2 (HF <3) and fa3 backends
         fullgraph = self.attn_backend not in ["fa2", "fa3"]
@@ -298,6 +388,15 @@ class Qwen2Bench:
 
     @contextmanager
     def enable_attn_backend(self):
+        """Context manager that switches HF attention impl and SDPA kernel for a run.
+
+        On entry:
+        - Sets model.set_attn_implementation(...) according to ATTN_ALIASES
+        - If an SDPA backend is used, selects the concrete SDPBackend via sdpa_kernel
+
+        On exit:
+        - Restores attention implementation to "eager" for safety
+        """
         self.model.set_attn_implementation(ATTN_ALIASES[self.attn_backend])
         if self.attn_backend.startswith("sdpa"):
             ctx = sdpa_kernel(SDPA_IMPL[self.attn_backend])
