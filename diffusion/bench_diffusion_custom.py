@@ -3,10 +3,14 @@
 
 import argparse
 import torch
+import os
+
+# Set CUDA memory allocator configuration to reduce fragmentation
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 from diffusers import MochiTransformer3DModel
 from custom_mochi_processors import set_mochi_attention_processor, get_available_backends
 import time
-import os
 
 # Import profiler if available
 try:
@@ -99,6 +103,7 @@ def benchmark_backend(
     # Benchmark
     print(f"[INFO] Benchmarking: {active} iterations...")
     times = []
+    trace_path = None
 
     if save_trace and HAS_PROFILER:
         os.makedirs(trace_dir, exist_ok=True)
@@ -112,11 +117,15 @@ def benchmark_backend(
 
         print(f"[INFO] Saving trace to: {trace_path}")
 
-        with profile(
+        # Create a new profiler instance for each backend to avoid state accumulation
+        prof = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
             with_stack=True,
-        ) as prof:
+        )
+
+        prof.start()
+        try:
             for i in range(active):
                 with torch.no_grad():
                     start = time.time()
@@ -125,9 +134,12 @@ def benchmark_backend(
                     elapsed = (time.time() - start) * 1000
                     times.append(elapsed)
                 print(f"  Iter {i+1}/{active}: {elapsed:.2f} ms")
-
-        prof.export_chrome_trace(trace_path)
-        print(f"[saved] Chrome trace -> {trace_path}")
+        finally:
+            prof.stop()
+            prof.export_chrome_trace(trace_path)
+            print(f"[saved] Chrome trace -> {trace_path}")
+            # Explicitly clean up profiler
+            del prof
 
     else:
         for i in range(active):
@@ -179,8 +191,25 @@ def main():
     parser.add_argument("--save-traces", action="store_true", help="Save profiler traces")
     parser.add_argument("--trace-dir", type=str, default="traces_diffusion_custom",
                         help="Directory for traces")
+    parser.add_argument("--device", type=int, default=None, help="CUDA device ID (auto-selects free GPU if not specified)")
 
     args = parser.parse_args()
+
+    # Auto-select GPU with most free memory if not specified
+    if args.device is None:
+        max_free = 0
+        best_device = 0
+        for i in range(torch.cuda.device_count()):
+            free_mem = torch.cuda.mem_get_info(i)[0]
+            if free_mem > max_free:
+                max_free = free_mem
+                best_device = i
+        args.device = best_device
+        print(f"[INFO] Auto-selected GPU {args.device} with {max_free / 1024**3:.2f} GB free")
+
+    # Set CUDA device
+    torch.cuda.set_device(args.device)
+    device = f"cuda:{args.device}"
 
     print("="*80)
     print("MOCHI DIFFUSION TRANSFORMER BENCHMARK (CUSTOM PROCESSORS)")
@@ -208,24 +237,20 @@ def main():
 
     print(f"Testing backends: {', '.join(backends)}")
 
-    # Load model
-    print(f"\n{'='*80}")
-    print("Loading Mochi model...")
-    print(f"{'='*80}")
+    # Initial cleanup to ensure clean state
+    print(f"\n[INFO] Performing initial memory cleanup...")
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    import gc
+    gc.collect()
 
-    model = MochiTransformer3DModel.from_pretrained(
-        "genmo/mochi-1-preview",
-        subfolder="transformer",
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-    ).to("cuda")
+    initial_mem = torch.cuda.memory_allocated() / 1024**3
+    initial_reserved = torch.cuda.memory_reserved() / 1024**3
+    print(f"[MEMORY] Initial state: {initial_mem:.2f} GB allocated, {initial_reserved:.2f} GB reserved")
 
-    print(f"Model loaded: {type(model).__name__}")
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
-
-    # Create inputs
+    # Create inputs once (can be reused across backends)
     print(f"\nCreating dummy inputs...")
-    inputs = create_dummy_inputs(args.frames, args.height, args.width)
+    inputs = create_dummy_inputs(args.frames, args.height, args.width, device=device)
 
     print(f"Input shapes:")
     for key, val in inputs.items():
@@ -233,9 +258,29 @@ def main():
 
     # Benchmark each backend
     results = []
-    for backend in backends:
-        # Reload model for each backend to avoid cross-contamination
-        torch.cuda.empty_cache()
+    for i, backend in enumerate(backends):
+        print(f"\n{'='*80}")
+        print(f"Backend {i+1}/{len(backends)}: {backend.upper()}")
+        print(f"{'='*80}")
+
+        # Display memory before loading model
+        torch.cuda.synchronize()
+        mem_before = torch.cuda.memory_allocated() / 1024**3
+        mem_reserved_before = torch.cuda.memory_reserved() / 1024**3
+        print(f"[MEMORY] Before model load: {mem_before:.2f} GB allocated, {mem_reserved_before:.2f} GB reserved")
+
+        # Load fresh model for each backend to prevent memory accumulation
+        print(f"[INFO] Loading fresh model for {backend}...")
+        model = MochiTransformer3DModel.from_pretrained(
+            "genmo/mochi-1-preview",
+            subfolder="transformer",
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+        ).to(device)
+
+        torch.cuda.synchronize()
+        mem_after_load = torch.cuda.memory_allocated() / 1024**3
+        print(f"[MEMORY] After model load: {mem_after_load:.2f} GB allocated (+{mem_after_load - mem_before:.2f} GB)")
 
         result = benchmark_backend(
             model,
@@ -249,9 +294,28 @@ def main():
         )
         results.append(result)
 
-        # Clear compilation cache between backends
+        # Aggressive cleanup between backends
+        print(f"[INFO] Cleaning up memory for {backend}...")
+        del model
+        torch.cuda.synchronize()
+
+        # Clear compilation cache
         if args.compile:
             torch._dynamo.reset()
+
+        # Aggressive CUDA cache clearing
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+        # Force garbage collection
+        import gc
+        gc.collect()
+
+        torch.cuda.synchronize()
+        mem_after_cleanup = torch.cuda.memory_allocated() / 1024**3
+        mem_reserved_after = torch.cuda.memory_reserved() / 1024**3
+        print(f"[MEMORY] After cleanup: {mem_after_cleanup:.2f} GB allocated, {mem_reserved_after:.2f} GB reserved")
+        print(f"[MEMORY] Freed: {mem_after_load - mem_after_cleanup:.2f} GB")
 
     # Summary
     print(f"\n{'='*80}")
