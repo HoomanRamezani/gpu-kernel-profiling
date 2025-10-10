@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark Mochi diffusion transformer with REAL backend switching using custom processors."""
+"""Benchmark Mochi diffusion transformer - SINGLE BLOCK ONLY (like transformer benchmark)."""
 
 import argparse
 import torch
@@ -20,83 +20,110 @@ except ImportError:
     HAS_PROFILER = False
 
 
-def create_dummy_inputs(frames, height, width, device="cuda", dtype=torch.float16):
-    """Create dummy inputs for Mochi transformer."""
-    # Mochi uses patch_size=2, so spatial dims are //2
-    latent_height = height // 2
-    latent_width = width // 2
-    latent_frames = frames
+def prepare_single_block_inputs(model, frames, height, width, text_seq_len=256, device="cuda", dtype=torch.float16):
+    """Create inputs for a SINGLE Mochi transformer block (not full model).
 
-    # Mochi has 12 latent channels
+    Similar to transformer benchmark, we run preprocessing then benchmark only one block.
+    """
     batch_size = 1
-    latent_channels = 12
+    in_channels = 12
+    patch_size = model.config.patch_size
+    text_embed_dim = model.config.text_embed_dim
 
-    hidden_states = torch.randn(
-        batch_size,
-        latent_channels,
-        latent_frames,
-        latent_height,
-        latent_width,
-        device=device,
-        dtype=dtype,
+    # Create raw inputs
+    raw_latents = torch.randn(
+        batch_size, in_channels, frames, height // 2, width // 2,
+        device=device, dtype=dtype
     )
 
-    # Text embeddings: max 256 tokens, 4096 dim
-    encoder_hidden_states = torch.randn(
-        batch_size, 256, 4096, device=device, dtype=dtype
-    )
-
-    # Attention mask for text
-    encoder_attention_mask = torch.ones(
-        batch_size, 256, device=device, dtype=torch.bool
-    )
-
-    # Timestep (LongTensor)
     timestep = torch.tensor([500], device=device, dtype=torch.long)
+
+    encoder_hidden_states_raw = torch.randn(
+        batch_size, text_seq_len, text_embed_dim,
+        device=device, dtype=dtype
+    )
+
+    encoder_attention_mask = torch.ones(
+        batch_size, text_seq_len,
+        device=device, dtype=torch.bool
+    )
+
+    # Run through preprocessing (time embed, patch embed, rope)
+    with torch.no_grad():
+        # Time embedding
+        temb, encoder_hidden_states = model.time_embed(
+            timestep,
+            encoder_hidden_states_raw,
+            encoder_attention_mask,
+            hidden_dtype=dtype,
+        )
+
+        # Patch embedding
+        post_patch_height = (height // 2) // patch_size
+        post_patch_width = (width // 2) // patch_size
+
+        hidden_states = raw_latents.permute(0, 2, 1, 3, 4).flatten(0, 1)
+        hidden_states = model.patch_embed(hidden_states)
+        hidden_states = hidden_states.unflatten(0, (batch_size, -1)).flatten(1, 2)
+
+        # RoPE embeddings
+        image_rotary_emb = model.rope(
+            model.pos_frequencies,
+            frames,
+            post_patch_height,
+            post_patch_width,
+            device=device,
+            dtype=torch.float32,
+        )
 
     return {
         "hidden_states": hidden_states,
         "encoder_hidden_states": encoder_hidden_states,
         "encoder_attention_mask": encoder_attention_mask,
-        "timestep": timestep,
+        "temb": temb,
+        "image_rotary_emb": image_rotary_emb,
     }
 
 
 def benchmark_backend(
-    model,
+    block,
     backend,
     inputs,
+    block_idx,
     warmup=3,
     active=5,
     use_compile=False,
     save_trace=False,
-    trace_dir="traces_diffusion_custom",
+    trace_dir="traces_diffusion_single_block",
 ):
-    """Benchmark a specific attention backend."""
+    """Benchmark a specific attention backend on a SINGLE transformer block."""
 
     print(f"\n{'='*80}")
-    print(f"Benchmarking backend: {backend.upper()}")
+    print(f"Benchmarking backend: {backend.upper()} (Block {block_idx})")
     print(f"{'='*80}")
-
-    # Set the custom processor
-    model = set_mochi_attention_processor(model, backend)
 
     # Compile if requested
     if use_compile:
-        print("[INFO] Compiling model (this may take several minutes)...")
+        print("[INFO] Compiling block (this may take several minutes)...")
         torch._dynamo.config.capture_dynamic_output_shape_ops = True
-        model.forward = torch.compile(
-            model.forward,
+        block.forward = torch.compile(
+            block.forward,
             mode="max-autotune",
             fullgraph=False,
             dynamic=True,
         )
 
+        # Warmup compile
+        for _ in range(3):
+            with torch.no_grad():
+                _ = block(**inputs)
+        torch.cuda.synchronize()
+
     # Warmup
     print(f"[INFO] Warmup: {warmup} iterations...")
     for i in range(warmup):
         with torch.no_grad():
-            output = model(**inputs)
+            output = block(**inputs)
         torch.cuda.synchronize()
         print(f"  Warmup {i+1}/{warmup}")
 
@@ -107,10 +134,8 @@ def benchmark_backend(
 
     if save_trace and HAS_PROFILER:
         os.makedirs(trace_dir, exist_ok=True)
-        frames = inputs["hidden_states"].shape[2]
-        height = inputs["hidden_states"].shape[3] * 2
-        width = inputs["hidden_states"].shape[4] * 2
-        trace_name = f"trace_mochi_{backend}_F{frames}_H{height}_W{width}_B1_custom"
+        seq_len = inputs["hidden_states"].shape[1]
+        trace_name = f"trace_mochi_{backend}_block{block_idx}_seq{seq_len}_custom"
         if use_compile:
             trace_name += "_compiled"
         trace_path = os.path.join(trace_dir, f"{trace_name}.json")
@@ -129,7 +154,7 @@ def benchmark_backend(
             for i in range(active):
                 with torch.no_grad():
                     start = time.time()
-                    output = model(**inputs)
+                    output = block(**inputs)
                     torch.cuda.synchronize()
                     elapsed = (time.time() - start) * 1000
                     times.append(elapsed)
@@ -145,7 +170,7 @@ def benchmark_backend(
         for i in range(active):
             with torch.no_grad():
                 start = time.time()
-                output = model(**inputs)
+                output = block(**inputs)
                 torch.cuda.synchronize()
                 elapsed = (time.time() - start) * 1000
                 times.append(elapsed)
@@ -179,17 +204,18 @@ def benchmark_backend(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark Mochi with real backend switching")
+    parser = argparse.ArgumentParser(description="Benchmark SINGLE Mochi transformer block (like transformer benchmark)")
+    parser.add_argument("--block", type=int, default=0, help="Which block to benchmark (0-47)")
     parser.add_argument("--frames", type=int, default=8, help="Number of frames")
-    parser.add_argument("--height", type=int, default=64, help="Height")
-    parser.add_argument("--width", type=int, default=64, help="Width")
+    parser.add_argument("--height", type=int, default=64, help="Height (pixel space)")
+    parser.add_argument("--width", type=int, default=64, help="Width (pixel space)")
     parser.add_argument("--backends", nargs="+", default=None,
                         help="Backends to test (default: all available)")
     parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations")
     parser.add_argument("--active", type=int, default=5, help="Active iterations")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile")
     parser.add_argument("--save-traces", action="store_true", help="Save profiler traces")
-    parser.add_argument("--trace-dir", type=str, default="traces_diffusion_custom",
+    parser.add_argument("--trace-dir", type=str, default="traces_diffusion_single_block",
                         help="Directory for traces")
     parser.add_argument("--device", type=int, default=None, help="CUDA device ID (auto-selects free GPU if not specified)")
 
@@ -212,9 +238,10 @@ def main():
     device = f"cuda:{args.device}"
 
     print("="*80)
-    print("MOCHI DIFFUSION TRANSFORMER BENCHMARK (CUSTOM PROCESSORS)")
+    print("MOCHI SINGLE BLOCK BENCHMARK (Like transformer/bench.py)")
     print("="*80)
     print(f"Configuration:")
+    print(f"  Block index: {args.block}")
     print(f"  Frames: {args.frames}")
     print(f"  Resolution: {args.height}x{args.width}")
     print(f"  Warmup: {args.warmup}")
@@ -248,13 +275,38 @@ def main():
     initial_reserved = torch.cuda.memory_reserved() / 1024**3
     print(f"[MEMORY] Initial state: {initial_mem:.2f} GB allocated, {initial_reserved:.2f} GB reserved")
 
+    # Load model ONCE (we'll extract the block and reuse it)
+    print(f"\n[INFO] Loading Mochi model...")
+    torch.cuda.synchronize()
+    mem_before = torch.cuda.memory_allocated() / 1024**3
+
+    model = MochiTransformer3DModel.from_pretrained(
+        "genmo/mochi-1-preview",
+        subfolder="transformer",
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+    ).to(device)
+
+    torch.cuda.synchronize()
+    mem_after = torch.cuda.memory_allocated() / 1024**3
+    print(f"[MEMORY] Model loaded: {mem_after:.2f} GB (+{mem_after - mem_before:.2f} GB)")
+
+    num_blocks = len(model.transformer_blocks)
+    print(f"[INFO] Model has {num_blocks} transformer blocks, benchmarking block {args.block}")
+
+    if args.block >= num_blocks:
+        raise ValueError(f"Block index {args.block} out of range (model has {num_blocks} blocks)")
+
     # Create inputs once (can be reused across backends)
-    print(f"\nCreating dummy inputs...")
-    inputs = create_dummy_inputs(args.frames, args.height, args.width, device=device)
+    print(f"\nPreparing inputs for single block...")
+    inputs = prepare_single_block_inputs(model, args.frames, args.height, args.width, device=device)
 
     print(f"Input shapes:")
     for key, val in inputs.items():
-        print(f"  {key}: {val.shape if hasattr(val, 'shape') else val}")
+        if hasattr(val, 'shape'):
+            print(f"  {key}: {val.shape}")
+        elif isinstance(val, tuple):
+            print(f"  {key}: tuple of {len(val)} tensors")
 
     # Benchmark each backend
     results = []
@@ -263,29 +315,17 @@ def main():
         print(f"Backend {i+1}/{len(backends)}: {backend.upper()}")
         print(f"{'='*80}")
 
-        # Display memory before loading model
-        torch.cuda.synchronize()
-        mem_before = torch.cuda.memory_allocated() / 1024**3
-        mem_reserved_before = torch.cuda.memory_reserved() / 1024**3
-        print(f"[MEMORY] Before model load: {mem_before:.2f} GB allocated, {mem_reserved_before:.2f} GB reserved")
+        # Set processor on model
+        model = set_mochi_attention_processor(model, backend)
 
-        # Load fresh model for each backend to prevent memory accumulation
-        print(f"[INFO] Loading fresh model for {backend}...")
-        model = MochiTransformer3DModel.from_pretrained(
-            "genmo/mochi-1-preview",
-            subfolder="transformer",
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-        ).to(device)
-
-        torch.cuda.synchronize()
-        mem_after_load = torch.cuda.memory_allocated() / 1024**3
-        print(f"[MEMORY] After model load: {mem_after_load:.2f} GB allocated (+{mem_after_load - mem_before:.2f} GB)")
+        # Extract the specific block to benchmark
+        block = model.transformer_blocks[args.block]
 
         result = benchmark_backend(
-            model,
+            block,
             backend,
             inputs,
+            block_idx=args.block,
             warmup=args.warmup,
             active=args.active,
             use_compile=args.compile,
@@ -294,28 +334,20 @@ def main():
         )
         results.append(result)
 
-        # Aggressive cleanup between backends
-        print(f"[INFO] Cleaning up memory for {backend}...")
-        del model
-        torch.cuda.synchronize()
-
-        # Clear compilation cache
+        # Clear compilation cache between backends
         if args.compile:
             torch._dynamo.reset()
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
 
-        # Aggressive CUDA cache clearing
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-
-        # Force garbage collection
-        import gc
-        gc.collect()
-
-        torch.cuda.synchronize()
-        mem_after_cleanup = torch.cuda.memory_allocated() / 1024**3
-        mem_reserved_after = torch.cuda.memory_reserved() / 1024**3
-        print(f"[MEMORY] After cleanup: {mem_after_cleanup:.2f} GB allocated, {mem_reserved_after:.2f} GB reserved")
-        print(f"[MEMORY] Freed: {mem_after_load - mem_after_cleanup:.2f} GB")
+    # Cleanup model
+    print(f"\n[INFO] Cleaning up model...")
+    del model
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
 
     # Summary
     print(f"\n{'='*80}")
