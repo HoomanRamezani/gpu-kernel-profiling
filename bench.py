@@ -1,5 +1,23 @@
 import argparse
 
+# Patch SM103 -> SM100 for FA4 support on B300
+import torch
+from cutlass.base_dsl.arch import Arch
+if not hasattr(Arch, 'sm_103'):
+    Arch._value2member_map_[(10, 3, "")] = Arch.sm_100
+    Arch._value2member_map_[(10, 3, "a")] = Arch.sm_100a
+    Arch.sm_103 = Arch.sm_100
+    Arch.sm_103a = Arch.sm_100a
+
+import flash_attn.cute.cute_dsl_utils as cute_utils
+original_get_device_capacity = cute_utils.get_device_capacity.__wrapped__
+def patched_get_device_capacity(device=None):
+    cap = original_get_device_capacity(device)
+    if cap == (10, 3):
+        return (10, 0)
+    return cap
+cute_utils.get_device_capacity = cute_utils.lru_cache(patched_get_device_capacity)
+
 from modeling_tools import Qwen2Bench
 
 def format_ms(t_s):
