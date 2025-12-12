@@ -12,7 +12,7 @@ def main():
     parser.add_argument("--dtype", type=str, choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--batch", type=int, default=1)
-    parser.add_argument("--seq", type=int, nargs="+", default=[512, ])
+    parser.add_argument("--seq", type=int, nargs="+", default=[512, 1024, 2048, 4096, 8192, 16384])
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--active", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=1)
@@ -23,10 +23,10 @@ def main():
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["eager", "sdpa", "fa2"],
+        default=["sdpa_cudnn", "fa2", "fa4"],
         help=(
             "Which implementations to test. "
-            "Supported: eager, sdpa_cudnn, sdpa_flash, sdpa_mem, sdpa_math, fa2, flex, fa3 (fa3 needs to be installed)"
+            "Supported: eager, sdpa_cudnn, sdpa_flash, sdpa_mem, sdpa_math, fa2, fa4, flex, fa3 (fa3/fa4 need to be installed)"
         ),
     )
     args = parser.parse_args()
@@ -46,12 +46,30 @@ def main():
             ))
 
     # Pretty summary
-    print("\n=== Per-impl timing (lower is better) ===")
-    width = max(len(r["impl"]) for r in results) + 2
-    print(f"{'impl'.ljust(width)} | per-step (active) | trace")
-    print("-" * (width + 36 + 8))
+    print("\n" + "=" * 100)
+    print("=== Per-impl timing (lower is better) ===")
+    print("=" * 100)
+
+    # Group results by sequence length
+    seq_groups = {}
     for r in results:
-        print(f"{r['impl'].ljust(width)} | {format_ms(r['per_step_ms']):>16} | {r['trace']}")
+        seq_len = r.get('seq_len', 'unknown')
+        if seq_len not in seq_groups:
+            seq_groups[seq_len] = []
+        seq_groups[seq_len].append(r)
+
+    for seq_len in sorted(seq_groups.keys()):
+        print(f"\nSequence Length: {seq_len}")
+        print("-" * 100)
+
+        width = max(len(r["impl"]) for r in seq_groups[seq_len]) + 2
+        print(f"{'Implementation'.ljust(width)} | {'Time (ms)':>12} | Trace")
+        print("-" * 100)
+
+        for r in seq_groups[seq_len]:
+            print(f"{r['impl'].ljust(width)} | {format_ms(r['per_step_ms']):>12} | {r['trace']}")
+
+    print("\n" + "=" * 100)
 
 
 if __name__ == "__main__":

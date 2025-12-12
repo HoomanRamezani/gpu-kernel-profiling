@@ -13,6 +13,7 @@ import threading
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from transformers import AttentionInterface
+from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
 from math import sqrt
 
 try:
@@ -21,10 +22,17 @@ try:
 except:
     _HAVE_FA3 = False
 
+try:
+    from flash_attn.cute import flash_attn_func as fa4_func
+    _HAVE_FA4 = True
+except:
+    _HAVE_FA4 = False
+
 
 ATTN_ALIASES = {
     "fa2": "flash_attention_2",
     "fa3": "flash_attention_3",
+    "fa4": "fa4_custom",  # Custom implementation using CUTE-DSL
     "eager": "eager",
     "sdpa_cudnn": "sdpa",
     "sdpa_flash": "sdpa",
@@ -63,10 +71,91 @@ def build_additive_causal_mask_4d(attn2d: torch.Tensor, *, device, dtype=torch.f
     mask = torch.zeros((B, 1, S, S), device=device, dtype=dtype)
     neg = torch.finfo(dtype).min
     mask = mask.masked_fill(~tri, neg)
-    
+
     key_pad = (~attn2d).unsqueeze(1).unsqueeze(2).to(mask.dtype) * neg  # [B,1,1,S]
     mask = mask + key_pad
     return mask
+
+
+class FA4AttentionWrapper:
+    """Wrapper to replace HF attention with FlashAttention-4 CUTE."""
+    def __init__(self, original_attn):
+        self.original_attn = original_attn
+        self._original_forward = original_attn.forward
+
+    def __enter__(self):
+        """Replace forward method with FA4 implementation."""
+        def fa4_forward(
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+            cache_position=None,
+            position_embeddings=None,
+            **kwargs,
+        ):
+            if not _HAVE_FA4:
+                raise RuntimeError("FlashAttention-4 (CUTE) is not installed. Install with: pip install flash-attn-cute")
+
+            bsz, q_len, _ = hidden_states.size()
+
+            # QKV projection
+            query_states = self.original_attn.q_proj(hidden_states)
+            key_states = self.original_attn.k_proj(hidden_states)
+            value_states = self.original_attn.v_proj(hidden_states)
+
+            # Reshape for multi-head attention
+            num_heads = self.original_attn.config.num_attention_heads
+            num_kv_heads = self.original_attn.config.num_key_value_heads
+            head_dim = self.original_attn.head_dim
+
+            query_states = query_states.view(bsz, q_len, num_heads, head_dim)
+            key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim)
+            value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim)
+
+            # Apply RoPE
+            if position_embeddings is None:
+                cos, sin = self.original_attn.rotary_emb(value_states, position_ids)
+            else:
+                cos, sin = position_embeddings
+
+            # apply_rotary_pos_emb expects [batch, heads, seq, head_dim], so transpose
+            query_states = query_states.transpose(1, 2)  # [B, H, S, D]
+            key_states = key_states.transpose(1, 2)      # [B, H, S, D]
+
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+            # Transpose back to [B, S, H, D] for FA4
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+
+            # FA4 expects [B, S, H, D] format (already correct after transpose)
+
+            # Use FA4 for attention computation
+            # FA4 expects (batch, seqlen, nheads, headdim)
+            attn_output, _ = fa4_func(
+                query_states,
+                key_states,
+                value_states,
+                causal=True,  # Causal for autoregressive LLMs
+                softmax_scale=1.0 / sqrt(head_dim),
+            )
+
+            # Reshape and project output
+            attn_output = attn_output.reshape(bsz, q_len, -1)
+            attn_output = self.original_attn.o_proj(attn_output)
+
+            # Return format: (attn_output, present_key_value)
+            return attn_output, past_key_value
+
+        self.original_attn.forward = fa4_forward
+        return self
+
+    def __exit__(self, *args):
+        """Restore original forward method."""
+        self.original_attn.forward = self._original_forward
 
 
 class Qwen2Bench:
@@ -217,6 +306,7 @@ class Qwen2Bench:
 
         return {
             "impl": self.attn_backend,
+            "seq_len": self.seq_len,
             "per_step_ms": per_step_ms / 1000.0,  # seconds
             "trace": trace_path,
         }
@@ -263,8 +353,8 @@ class Qwen2Bench:
         
     def compile_module(self, module, bench_mode):
 
-        # full CUDA graph does not work for vanilla fa2 (HF <3) and fa3 backends
-        fullgraph = self.attn_backend not in ["fa2", "fa3"]
+        # full CUDA graph does not work for vanilla fa2 (HF <3), fa3, and fa4 backends
+        fullgraph = self.attn_backend not in ["fa2", "fa3", "fa4"]
         
         module.forward = torch.compile(
             module.forward, 
@@ -298,16 +388,32 @@ class Qwen2Bench:
 
     @contextmanager
     def enable_attn_backend(self):
-        self.model.set_attn_implementation(ATTN_ALIASES[self.attn_backend])
-        if self.attn_backend.startswith("sdpa"):
-            ctx = sdpa_kernel(SDPA_IMPL[self.attn_backend])
-        else:
-            ctx = nullcontext()
-        
-        try:
-            with ctx as c:
-                yield c
-        finally:
+        # Special handling for FA4
+        if self.attn_backend == "fa4":
+            if not _HAVE_FA4:
+                raise RuntimeError("FlashAttention-4 (CUTE) is not installed. Install with: pip install flash-attn-cute")
+
+            # Keep model in eager mode but use FA4 wrapper
             self.model.set_attn_implementation("eager")
+            layer = self.model.model.layers[self.layer_idx]
+            fa4_wrapper = FA4AttentionWrapper(layer.self_attn)
+
+            try:
+                with fa4_wrapper:
+                    yield None
+            finally:
+                self.model.set_attn_implementation("eager")
+        else:
+            self.model.set_attn_implementation(ATTN_ALIASES[self.attn_backend])
+            if self.attn_backend.startswith("sdpa"):
+                ctx = sdpa_kernel(SDPA_IMPL[self.attn_backend])
+            else:
+                ctx = nullcontext()
+
+            try:
+                with ctx as c:
+                    yield c
+            finally:
+                self.model.set_attn_implementation("eager")
 
 
